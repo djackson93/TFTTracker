@@ -1,9 +1,27 @@
 import requests
 import sqlite3
+from datetime import datetime
 import pandas as pd
 from riotwatcher import LolWatcher, TftWatcher, ApiError
 from dotenv import load_dotenv
 import os
+
+# --- datetime setup ---
+# Adapter: converts Python datetime to string for SQLite
+def adapt_datetime(dt):
+    return dt.isoformat(" ")
+
+# Converter: converts SQLite string back to Python datetime
+def convert_datetime(s):
+    return datetime.fromisoformat(s.decode())
+
+# Register them
+sqlite3.register_adapter(datetime, adapt_datetime)
+sqlite3.register_converter("DATETIME", convert_datetime)
+
+# Connect to DB with detect_types
+conn = sqlite3.connect("tft_matches.db", detect_types=sqlite3.PARSE_DECLTYPES)
+cur = conn.cursor()
 
 # ---- CONFIG FROM .env ----
 load_dotenv()  # read .env file
@@ -14,6 +32,8 @@ continent = os.getenv("CONTINENT")
 match_count = int(os.getenv("MATCH_COUNT"))
 
 headers = {"X-Riot-Token": api_key}
+
+## print(api_key)
 
 # ---- INIT ----
 watcher = LolWatcher(api_key)
@@ -45,7 +65,7 @@ for gameName, tagLine in riot_ids:
 
 print(summoners)
 
-# ---- SETUP DATABASE ----
+# -------------------- SETUP DATABASE ----------------------------
 conn = sqlite3.connect("tft_matches.db")
 cur = conn.cursor()
 
@@ -54,12 +74,27 @@ CREATE TABLE IF NOT EXISTS matches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     player TEXT,
     puuid TEXT,
-    match_id TEXT,
+    match_id TEXT UNIQUE,
     placement INTEGER,
     augments TEXT,
-    traits TEXT
+    traits TEXT,
+    start_timestamp DATETIME,
+    end_timestamp DATETIME,
+    match_length DECIMAL
 )
 """)
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS rank_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    summoner_id TEXT,
+    summoner_name TEXT,
+    rank_tier TEXT,
+    league_points INTEGER,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+""")
+
 conn.commit()
 
 # ---- FETCH MATCH DATA ----
@@ -68,9 +103,35 @@ for name, info in summoners.items():
     try:
         match_ids = tft_watcher.match.by_puuid(continent, puuid, count=match_count)
 
+        # --- Check latest match timestamp for the player to eliminate rechecking whole set---
+        cur.execute("SELECT MAX(start_timestamp) FROM matches WHERE puuid = ?", (puuid,))
+        last_timestamp = cur.fetchone()[0]
+
+        if last_timestamp:
+            if isinstance(last_timestamp, str):
+                last_timestamp = datetime.fromisoformat(last_timestamp)
+            start_time = int(last_timestamp.timestamp())
+        else:
+            start_time = None  # Want to fetch all games if no previous game history has been recorded
+
+        params = {}
+        if start_time:
+            params["start"] = start_time
+
+        # --- Step 1: Get only NEW matches ---
+        match_ids = tft_watcher.match.by_puuid(continent, puuid, **params)
+
+        new_matches_count = 0  # counter for inserted rows
+
+        # --- Step 2: Process each of the matches ---
         for match_id in match_ids:
             match = tft_watcher.match.by_id(continent, match_id)
             info_match = match['info']
+
+            # Pull timestamps once per match
+            start_time = info_match.get("game_datetime")  # in ms since epoch
+            end_time = start_time + info_match.get("game_length", 0) * 1000  # add length (seconds → ms)
+            match_length = info_match.get("game_length", 0)  # already seconds
 
             for p in info_match['participants']:
                 if p['puuid'] == puuid:
@@ -80,16 +141,28 @@ for name, info in summoners.items():
                         "match_id": match_id,
                         "placement": p.get("placement", 0),
                         "augments": ",".join(p.get("augments", [])),
-                        "traits": ",".join([t["name"] for t in p.get("traits", []) if t["tier_current"] > 0])
+                        "traits": ",".join([t["name"] for t in p.get("traits", []) if t["tier_current"] > 0]),
+                        "start_timestamp": datetime.fromtimestamp(info_match["game_datetime"] / 1000),
+                        "end_timestamp": datetime.fromtimestamp(
+                            (info_match["game_datetime"] + info_match["game_length"] * 1000) / 1000),
+                        "match_length": info_match["game_length"]
                     }
 
                     cur.execute("""
-                        INSERT INTO matches (player, puuid, match_id, placement, augments, traits)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, (
-                        record["player"], record["puuid"], record["match_id"],
-                        record["placement"], record["augments"], record["traits"]
+                            INSERT OR IGNORE INTO matches
+                            (player, puuid, match_id, placement, augments, traits, start_timestamp, end_timestamp, match_length)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                                    record["player"], record["puuid"], record["match_id"],
+                                    record["placement"], record["augments"], record["traits"],
+                                    record["start_timestamp"], record["end_timestamp"], record["match_length"]
                     ))
+
+                    if cur.rowcount > 0:  # was actually inserted
+                        new_matches_count += 1
+
+        print(f"Player [{name}] had {new_matches_count} new matches stored on this run.")
+
         conn.commit()
 
     except ApiError as err:
